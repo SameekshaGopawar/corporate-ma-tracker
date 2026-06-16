@@ -1,0 +1,43 @@
+# Secret keys — never upload these
+.env
+.env.local
+.env.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution
+dist/
+build/
+*.egg-info/
