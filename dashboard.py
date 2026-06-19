@@ -1,5 +1,5 @@
 import re
-import subprocess
+from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -51,7 +51,6 @@ h3 { font-size:0.8rem!important; font-weight:600!important; color:#8b949e!import
 .badge-high   { background:#1a3a1a; color:#3fb950; border:1px solid #3fb950; }
 .badge-medium { background:#2d2a0f; color:#d29922; border:1px solid #d29922; }
 
-/* Compact deal card */
 .deal-card {
     background:#1c2128; border:1px solid #30363d;
     border-left:3px solid #58a6ff; border-radius:8px;
@@ -63,6 +62,16 @@ h3 { font-size:0.8rem!important; font-weight:600!important; color:#8b949e!import
 .deal-value  { color:#3fb950; font-weight:600; font-size:0.82rem; white-space:nowrap; }
 .deal-unknown { color:#484f58; font-style:italic; }
 .deal-right  { display:flex; align-items:center; gap:10px; flex-shrink:0; }
+
+.info-box {
+    background:#161b22; border:1px solid #30363d; border-left:3px solid #d29922;
+    border-radius:8px; padding:12px 16px; margin-bottom:12px;
+    font-size:0.82rem; color:#8b949e; line-height:1.6;
+}
+.info-box code {
+    background:#0f1117; color:#58a6ff; padding:1px 5px;
+    border-radius:3px; font-size:0.78rem;
+}
 
 [data-testid="stTextInput"] input,
 [data-testid="stSelectbox"] > div {
@@ -87,8 +96,8 @@ hr { border-color:#21262d!important; }
 # CONSTANTS
 # ─────────────────────────────────────────────
 
-CSV_PATH = "ma_deals.csv"
-PIPELINE = "ma_tracker.py"
+# Path resolves relative to this file — works locally and on Streamlit Cloud
+CSV_PATH = Path(__file__).parent / "ma_deals.csv"
 
 KNOWN_DOMAINS = {
     "google": "google.com", "microsoft": "microsoft.com",
@@ -100,7 +109,6 @@ KNOWN_DOMAINS = {
     "trucordia": "trucordia.com", "nagase": "nagase.com",
 }
 
-# Words that indicate the NLP grabbed a deal descriptor instead of a company name
 BAD_NAME_PATTERNS = re.compile(
     r"(acquisition|merger|buyout|purchase|takeover|deal|"
     r"billion|million|\$|\d+bn|\d+m\b)",
@@ -112,34 +120,31 @@ BAD_NAME_PATTERNS = re.compile(
 # ─────────────────────────────────────────────
 
 def clean_entity(name):
-    """
-    Return the name as-is if it looks like a real company.
-    Return 'Unknown' if it looks like a price, a deal noun,
-    or starts with a digit — meaning the NLP made a mistake.
-    Examples rejected: '55bn acquisition', '$32 billion', '10 Boeing'
-    """
-    if not name or name.strip().lower() in ("unknown", "none", "nan", ""):
+    """Reject NLP extractions that look like prices or deal descriptors."""
+    if not name or str(name).strip().lower() in ("unknown", "none", "nan", ""):
         return "Unknown"
-    if BAD_NAME_PATTERNS.search(name):
+    if BAD_NAME_PATTERNS.search(str(name)):
         return "Unknown"
-    if name[0].isdigit():
+    if str(name)[0].isdigit():
         return "Unknown"
-    return name.strip()
+    return str(name).strip()
 
 
 def parse_deal_value(value_str):
+    """Parse deal value string to float in billions."""
     s = str(value_str).lower().replace(",", "")
     match = re.search(r"\$?([\d.]+)\s*(b|bn|billion|m|mn|million)?", s)
     if not match:
         return None
     number = float(match.group(1))
     unit   = match.group(2) or ""
-    if unit.startswith("b"):   return number
-    if unit.startswith("m"):   return round(number / 1000, 4)
+    if unit.startswith("b"): return number
+    if unit.startswith("m"): return round(number / 1000, 4)
     return number
 
 
 def find_largest_deal(df):
+    """Return the Deal_Value string for the row with the highest numeric value."""
     best_val, best_str = -1, "N/A"
     for v in df["Deal_Value"]:
         if v == "Unknown":
@@ -151,10 +156,11 @@ def find_largest_deal(df):
 
 
 def confidence_badge(score):
+    """Return a coloured HTML confidence badge."""
     score = float(score)
     if score >= 85:
         return f'<span class="badge badge-high">{score:.0f}% High</span>'
-    return     f'<span class="badge badge-medium">{score:.0f}% Med</span>'
+    return f'<span class="badge badge-medium">{score:.0f}% Med</span>'
 
 
 def logo_url(buyer_name):
@@ -174,7 +180,7 @@ def avatar_html(buyer_name):
             f'background:#fff;padding:2px;" '
             f'onerror="this.style.display=\'none\'">'
         )
-    colours = ["#1f6feb","#388bfd","#58a6ff","#2ea043","#d29922"]
+    colours = ["#1f6feb", "#388bfd", "#58a6ff", "#2ea043", "#d29922"]
     colour  = colours[sum(ord(c) for c in initials) % len(colours)]
     return (
         f'<span style="display:inline-flex;align-items:center;'
@@ -189,25 +195,31 @@ def avatar_html(buyer_name):
 
 @st.cache_data
 def load_data():
-    try:
-        df = pd.read_csv(CSV_PATH)
-    except FileNotFoundError:
-        st.error(f"Could not find {CSV_PATH}. Run ma_tracker.py first.")
-        st.stop()
+    """Read ma_deals.csv, clean entities, add numeric value column."""
+    if not CSV_PATH.exists():
+        # Return an empty DataFrame with the expected columns
+        # so the rest of the dashboard renders without crashing
+        return pd.DataFrame(columns=[
+            "Buyer", "Target", "Deal_Value", "Category",
+            "Acq_%", "Partner_%", "Invest_%", "Other_%"
+        ])
+
+    df = pd.read_csv(CSV_PATH)
 
     for col in ("Buyer", "Target", "Deal_Value"):
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
-    # ── Fix bad NLP extractions ──────────────────
-    # If the NLP grabbed a deal descriptor (e.g. "55bn acquisition")
-    # instead of a real company name, replace it with "Unknown".
     df["Buyer"]  = df["Buyer"].apply(clean_entity)
     df["Target"] = df["Target"].apply(clean_entity)
 
     df["Deal_Value_Num"] = df["Deal_Value"].apply(
         lambda v: parse_deal_value(v) if v != "Unknown" else None
     )
+
+    if "Acq_%" not in df.columns:
+        df["Acq_%"] = 0.0
+
     return df
 
 # ─────────────────────────────────────────────
@@ -233,7 +245,7 @@ def chart_by_buyer(df):
     fig = px.bar(counts, x="Deals", y="Buyer", orientation="h",
                  title="Acquisition Volume by Buyer",
                  color="Deals",
-                 color_continuous_scale=[[0,"#1f6feb"],[1,"#58a6ff"]])
+                 color_continuous_scale=[[0, "#1f6feb"], [1, "#58a6ff"]])
     fig.update_layout(**DARK, showlegend=False, coloraxis_showscale=False)
     fig.update_traces(marker_line_width=0,
                       hovertemplate="<b>%{y}</b><br>Deals: %{x}<extra></extra>")
@@ -243,12 +255,14 @@ def chart_by_buyer(df):
 
 
 def chart_donut(df):
-    bins, labels = [70,80,90,101], ["70-79%","80-89%","90-100%"]
+    if df.empty or "Acq_%" not in df.columns:
+        return go.Figure()
+    bins, labels = [70, 80, 90, 101], ["70-79%", "80-89%", "90-100%"]
     counts = pd.cut(df["Acq_%"], bins=bins, labels=labels,
                     right=False).value_counts().sort_index()
     fig = go.Figure(go.Pie(
         labels=counts.index, values=counts.values, hole=0.6,
-        marker=dict(colors=["#d29922","#1f6feb","#3fb950"],
+        marker=dict(colors=["#d29922", "#1f6feb", "#3fb950"],
                     line=dict(color="#0f1117", width=2)),
         textfont=dict(color="#e6edf3", size=12),
         hovertemplate="<b>%{label}</b><br>Count: %{value}<extra></extra>",
@@ -258,7 +272,7 @@ def chart_donut(df):
         legend=dict(orientation="h", yanchor="bottom", y=-0.25,
                     font=dict(color="#c9d1d9")),
         annotations=[dict(text=f"<b>{len(df)}</b><br>deals",
-                          x=0.5, y=0.5, font=dict(size=14,color="#e6edf3"),
+                          x=0.5, y=0.5, font=dict(size=14, color="#e6edf3"),
                           showarrow=False)],
     )
     return fig
@@ -272,7 +286,7 @@ def chart_treemap(df):
     fig = px.treemap(counts, path=["Buyer"], values="Deals",
                      title="Top Buyers Treemap",
                      color="Deals",
-                     color_continuous_scale=[[0,"#1f6feb"],[1,"#3fb950"]])
+                     color_continuous_scale=[[0, "#1f6feb"], [1, "#3fb950"]])
     fig.update_layout(**DARK, coloraxis_showscale=False)
     fig.update_traces(
         textfont=dict(color="#ffffff", size=13),
@@ -298,42 +312,35 @@ with hL:
     )
 with hR:
     st.markdown("<br>", unsafe_allow_html=True)
-    # Two buttons side by side
-    b1, b2 = st.columns(2)
-    with b1:
-        fetch = st.button("Fetch New Data", use_container_width=True, type="primary")
-    with b2:
-        reload = st.button("Reload CSV", use_container_width=True)
+    if st.button("Reload Data", use_container_width=True, type="primary"):
+        st.cache_data.clear()
+        st.rerun()
 
 st.divider()
 
-# ── Button actions ───────────────────────────
+# ── How to update data (cloud-friendly info box) ─
 
-if fetch:
-    # Run the full pipeline (NewsAPI → NLP → CSV) then reload
-    with st.spinner("Fetching live headlines and running NLP pipeline... (this takes ~60s)"):
-        result = subprocess.run(
-            ["python", PIPELINE],
-            capture_output=True, text=True,
-            cwd="C:/Users/Sameeksha/Desktop/MA_tracker"
-        )
-    if result.returncode == 0:
-        st.success("Pipeline complete! New deals loaded.")
-    else:
-        st.error(f"Pipeline error: {result.stderr[-500:] if result.stderr else 'unknown'}")
-    st.cache_data.clear()
-    st.rerun()
+st.markdown(
+    '<div class="info-box">'
+    '<b>To update with fresh headlines:</b> run <code>python ma_tracker.py</code> locally, '
+    'then push the updated <code>ma_deals.csv</code> to GitHub. '
+    'Streamlit Cloud will automatically reload within seconds.'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
-if reload:
-    # Just re-read the existing CSV without re-running the pipeline
-    st.cache_data.clear()
-    st.rerun()
-
-# ── Load & clean data ─────────────────────────
+# ── Load data ────────────────────────────────────
 
 df = load_data()
 
-# ── KPI cards ────────────────────────────────
+if df.empty:
+    st.warning(
+        "No deal data found. Run `python ma_tracker.py` locally to generate "
+        "`ma_deals.csv`, commit it, and push to GitHub."
+    )
+    st.stop()
+
+# ── KPI cards ────────────────────────────────────
 
 total_deals   = len(df)
 largest_deal  = find_largest_deal(df)
@@ -350,25 +357,25 @@ kpi_html = """
 
 k1, k2, k3, k4 = st.columns(4)
 with k1:
-    st.markdown(kpi_html.format(value=total_deals,
-        label="Total Deals Found", sub="classified as Acquisition"),
-        unsafe_allow_html=True)
+    st.markdown(kpi_html.format(
+        value=total_deals, label="Total Deals Found",
+        sub="classified as Acquisition"), unsafe_allow_html=True)
 with k2:
-    st.markdown(kpi_html.format(value=largest_deal,
-        label="Largest Deal Value", sub="highest single transaction"),
-        unsafe_allow_html=True)
+    st.markdown(kpi_html.format(
+        value=largest_deal, label="Largest Deal Value",
+        sub="highest single transaction"), unsafe_allow_html=True)
 with k3:
-    st.markdown(kpi_html.format(value=unique_buyers,
-        label="Unique Buyers", sub="distinct acquiring companies"),
-        unsafe_allow_html=True)
+    st.markdown(kpi_html.format(
+        value=unique_buyers, label="Unique Buyers",
+        sub="distinct acquiring companies"), unsafe_allow_html=True)
 with k4:
-    st.markdown(kpi_html.format(value=f"{avg_conf:.0f}%",
-        label="Avg Confidence", sub="across all Acquisition labels"),
-        unsafe_allow_html=True)
+    st.markdown(kpi_html.format(
+        value=f"{avg_conf:.0f}%", label="Avg Confidence",
+        sub="across all Acquisition labels"), unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Charts ────────────────────────────────────
+# ── Charts ────────────────────────────────────────
 
 cL, cR = st.columns([3, 2])
 with cL:
@@ -376,7 +383,7 @@ with cL:
     if fig:
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No named buyers yet — run Fetch New Data.")
+        st.info("No named buyers in current data.")
 with cR:
     st.plotly_chart(chart_donut(df), use_container_width=True)
 
@@ -386,7 +393,7 @@ if fig_tree:
 
 st.divider()
 
-# ── Filters ──────────────────────────────────
+# ── Filters ───────────────────────────────────────
 
 st.markdown("### Filters & Search")
 st.markdown("<br>", unsafe_allow_html=True)
@@ -415,7 +422,7 @@ if search:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Recent acquisitions — 2-column compact cards ──
+# ── Deal cards ────────────────────────────────────
 
 count_label = f'{len(filtered)} result{"s" if len(filtered) != 1 else ""}'
 st.markdown(
@@ -431,10 +438,9 @@ if filtered.empty:
         'No deals match your filters.</p>', unsafe_allow_html=True)
 else:
     rows = list(filtered.iterrows())
-    # Render in 2 columns
     for i in range(0, len(rows), 2):
         col_a, col_b = st.columns(2)
-        for col, idx in zip([col_a, col_b], [i, i+1]):
+        for col, idx in zip([col_a, col_b], [i, i + 1]):
             if idx >= len(rows):
                 break
             _, row = rows[idx]
@@ -458,10 +464,7 @@ else:
                 <div class="deal-card">
                   <div style="display:flex;align-items:center;gap:10px;">
                     {avatar_html(buyer)}
-                    <div>
-                      {buyer_html}
-                      {target_html}
-                    </div>
+                    <div>{buyer_html}{target_html}</div>
                   </div>
                   <div class="deal-right">
                     {value_html}
@@ -473,15 +476,16 @@ else:
 st.markdown("<br>", unsafe_allow_html=True)
 st.divider()
 
-# ── Raw data expander ─────────────────────────
+# ── Raw data expander ─────────────────────────────
 
 with st.expander("View raw data table"):
     show_cols = [c for c in
-                 ["Buyer","Target","Deal_Value","Acq_%","Partner_%","Invest_%","Other_%"]
+                 ["Buyer", "Target", "Deal_Value", "Acq_%",
+                  "Partner_%", "Invest_%", "Other_%"]
                  if c in filtered.columns]
     st.dataframe(filtered[show_cols], use_container_width=True, hide_index=True)
 
-# ── Footer ─────────────────────────────────────
+# ── Footer ────────────────────────────────────────
 
 st.markdown(
     '<p style="text-align:center;color:#484f58;font-size:0.72rem;padding:8px 0 2px;">'

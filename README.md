@@ -218,6 +218,38 @@ http://localhost:8501
 
 ---
 
+## Deploy to Streamlit Community Cloud
+
+The dashboard (`dashboard.py`) reads from `ma_deals.csv` committed in this repo and is fully compatible with Streamlit Community Cloud. The NLP pipeline (`ma_tracker.py`) is designed to run locally — it requires spaCy, NewsAPI, and Hugging Face credentials, which you manage on your own machine.
+
+### Steps
+
+1. Push this repository to GitHub (it must be public, or you must have a Streamlit account that can access private repos)
+2. Go to [streamlit.io/cloud](https://streamlit.io/cloud) and sign in with GitHub
+3. Click **New app**
+4. Set:
+   - **Repository**: `SameekshaGopawar/corporate-ma-tracker`
+   - **Branch**: `master`
+   - **Main file path**: `dashboard.py`
+5. Click **Deploy**
+
+No secrets are needed for the dashboard — it only reads the CSV file.
+
+### Updating data on the live app
+
+Run the pipeline locally, then push the new CSV:
+
+```bash
+python ma_tracker.py          # generates / updates ma_deals.csv locally
+git add ma_deals.csv
+git commit -m "Update M&A deals"
+git push
+```
+
+Streamlit Cloud detects the push and reloads automatically within seconds.
+
+---
+
 ## Future Improvements
 
 - [ ] PostgreSQL database instead of CSV for persistent storage
