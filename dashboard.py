@@ -1,8 +1,12 @@
+import os
 import re
+import time
 from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 # ─────────────────────────────────────────────
@@ -63,16 +67,6 @@ h3 { font-size:0.8rem!important; font-weight:600!important; color:#8b949e!import
 .deal-unknown { color:#484f58; font-style:italic; }
 .deal-right  { display:flex; align-items:center; gap:10px; flex-shrink:0; }
 
-.info-box {
-    background:#161b22; border:1px solid #30363d; border-left:3px solid #d29922;
-    border-radius:8px; padding:12px 16px; margin-bottom:12px;
-    font-size:0.82rem; color:#8b949e; line-height:1.6;
-}
-.info-box code {
-    background:#0f1117; color:#58a6ff; padding:1px 5px;
-    border-radius:3px; font-size:0.78rem;
-}
-
 [data-testid="stTextInput"] input,
 [data-testid="stSelectbox"] > div {
     background-color:#1c2128!important; border:1px solid #30363d!important;
@@ -93,11 +87,28 @@ hr { border-color:#21262d!important; }
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
+# API KEYS  (Streamlit secrets → env fallback)
+# ─────────────────────────────────────────────
+
+def _secret(key):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.environ.get(key, "")
+
+NEWS_API_KEY = _secret("NEWS_API_KEY")
+HF_API_TOKEN = _secret("HF_API_TOKEN")
+
+# ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
 
-# Path resolves relative to this file — works locally and on Streamlit Cloud
 CSV_PATH = Path(__file__).parent / "ma_deals.csv"
+
+HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
+HF_LABELS  = ["Acquisition", "Partnership", "Investment", "Other"]
+
+NEWS_QUERIES = ["company acquisition", "acquires", "merger deal", "buyout", "acquired"]
 
 KNOWN_DOMAINS = {
     "google": "google.com", "microsoft": "microsoft.com",
@@ -106,7 +117,6 @@ KNOWN_DOMAINS = {
     "oracle": "oracle.com", "sap": "sap.com",
     "ibm": "ibm.com", "cisco": "cisco.com",
     "adobe": "adobe.com", "teva": "tevapharm.com",
-    "trucordia": "trucordia.com", "nagase": "nagase.com",
 }
 
 BAD_NAME_PATTERNS = re.compile(
@@ -120,7 +130,6 @@ BAD_NAME_PATTERNS = re.compile(
 # ─────────────────────────────────────────────
 
 def clean_entity(name):
-    """Reject NLP extractions that look like prices or deal descriptors."""
     if not name or str(name).strip().lower() in ("unknown", "none", "nan", ""):
         return "Unknown"
     if BAD_NAME_PATTERNS.search(str(name)):
@@ -131,7 +140,6 @@ def clean_entity(name):
 
 
 def parse_deal_value(value_str):
-    """Parse deal value string to float in billions."""
     s = str(value_str).lower().replace(",", "")
     match = re.search(r"\$?([\d.]+)\s*(b|bn|billion|m|mn|million)?", s)
     if not match:
@@ -144,7 +152,6 @@ def parse_deal_value(value_str):
 
 
 def find_largest_deal(df):
-    """Return the Deal_Value string for the row with the highest numeric value."""
     best_val, best_str = -1, "N/A"
     for v in df["Deal_Value"]:
         if v == "Unknown":
@@ -156,70 +163,214 @@ def find_largest_deal(df):
 
 
 def confidence_badge(score):
-    """Return a coloured HTML confidence badge."""
     score = float(score)
     if score >= 85:
         return f'<span class="badge badge-high">{score:.0f}% High</span>'
     return f'<span class="badge badge-medium">{score:.0f}% Med</span>'
 
 
-def logo_url(buyer_name):
-    key = buyer_name.lower().split()[0] if buyer_name != "Unknown" else ""
-    domain = KNOWN_DOMAINS.get(key)
-    return f"https://logo.clearbit.com/{domain}" if domain else None
-
-
 def avatar_html(buyer_name):
-    url      = logo_url(buyer_name)
+    key    = buyer_name.lower().split()[0] if buyer_name != "Unknown" else ""
+    domain = KNOWN_DOMAINS.get(key)
     initials = "".join(w[0].upper() for w in buyer_name.split()[:2]) \
                if buyer_name != "Unknown" else "?"
-    if url:
+    if domain:
         return (
-            f'<img src="{url}" width="28" height="28" '
-            f'style="border-radius:5px;vertical-align:middle;'
-            f'background:#fff;padding:2px;" '
+            f'<img src="https://logo.clearbit.com/{domain}" width="28" height="28" '
+            f'style="border-radius:5px;vertical-align:middle;background:#fff;padding:2px;" '
             f'onerror="this.style.display=\'none\'">'
         )
     colours = ["#1f6feb", "#388bfd", "#58a6ff", "#2ea043", "#d29922"]
     colour  = colours[sum(ord(c) for c in initials) % len(colours)]
     return (
-        f'<span style="display:inline-flex;align-items:center;'
-        f'justify-content:center;width:28px;height:28px;border-radius:5px;'
-        f'background:{colour};color:#fff;font-size:0.7rem;font-weight:700;'
-        f'vertical-align:middle;">{initials}</span>'
+        f'<span style="display:inline-flex;align-items:center;justify-content:center;'
+        f'width:28px;height:28px;border-radius:5px;background:{colour};color:#fff;'
+        f'font-size:0.7rem;font-weight:700;vertical-align:middle;">{initials}</span>'
     )
 
 # ─────────────────────────────────────────────
-# DATA LOADER
+# LIVE PIPELINE (no spaCy — regex + HF API)
+# ─────────────────────────────────────────────
+
+# Patterns: (buyer_group, target_group) from headline text
+_PATTERNS = [
+    # "X acquires / acquired / buys / bought Y"
+    re.compile(
+        r"^(?P<buyer>[A-Z][A-Za-z0-9& .,']+?)\s+"
+        r"(?:acquires?|acquired|buys?|bought|purchases?|purchased)\s+"
+        r"(?P<target>[A-Z][A-Za-z0-9& .,']+)",
+        re.IGNORECASE,
+    ),
+    # "X to acquire Y" / "X plans to acquire Y"
+    re.compile(
+        r"^(?P<buyer>[A-Z][A-Za-z0-9& .,']+?)\s+"
+        r"(?:plans?\s+to|agrees?\s+to|set\s+to|moves?\s+to)?\s*"
+        r"acquire\s+(?P<target>[A-Z][A-Za-z0-9& .,']+)",
+        re.IGNORECASE,
+    ),
+    # "X closes / completes / announces acquisition of Y"
+    re.compile(
+        r"^(?P<buyer>[A-Z][A-Za-z0-9& .,']+?)\s+"
+        r"(?:closes?|completes?|announces?|finalizes?|seals?)\s+"
+        r"(?:\w+\s+)?acquisition\s+of\s+(?P<target>[A-Z][A-Za-z0-9& .,']+)",
+        re.IGNORECASE,
+    ),
+    # "acquisition of Y by X"
+    re.compile(
+        r"acquisition\s+of\s+(?P<target>[A-Z][A-Za-z0-9& .,']+?)"
+        r"\s+by\s+(?P<buyer>[A-Z][A-Za-z0-9& .,']+)",
+        re.IGNORECASE,
+    ),
+]
+
+_VALUE_RE = re.compile(
+    r"\$[\d.,]+\s*(?:billion|million|bn|mn|[bm])\b"
+    r"|\b[\d.,]+\s*(?:billion|million|bn|mn)\b",
+    re.IGNORECASE,
+)
+
+_STOP_WORDS = {
+    "the", "a", "an", "its", "their", "this", "that", "and", "or",
+    "in", "of", "to", "for", "on", "at", "by", "with", "from",
+    "deal", "shares", "stake", "unit", "inc", "corp", "ltd",
+}
+
+
+def _trim(text):
+    """Remove trailing filler words from extracted entity."""
+    text = re.sub(r"\s+(for|in|to|of|and|with|at|from|as|a|an|the)$",
+                  "", text.strip(), flags=re.IGNORECASE)
+    words = text.split()
+    filtered = [w for w in words if w.lower() not in _STOP_WORDS or len(words) == 1]
+    return " ".join(filtered).strip() or text.strip()
+
+
+def extract_entities(headline):
+    buyer, target, deal_value = "Unknown", "Unknown", "Unknown"
+
+    for pat in _PATTERNS:
+        m = pat.search(headline)
+        if m:
+            try:    buyer  = _trim(m.group("buyer"))
+            except Exception: pass
+            try:    target = _trim(m.group("target"))
+            except Exception: pass
+            break
+
+    vm = _VALUE_RE.search(headline)
+    if vm:
+        deal_value = vm.group(0).strip()
+
+    return clean_entity(buyer), clean_entity(target), deal_value
+
+
+def classify_headline(headline):
+    """Call HF zero-shot API. Returns (label, score_pct) or (None, 0)."""
+    if not HF_API_TOKEN:
+        return None, 0
+    try:
+        resp = requests.post(
+            HF_API_URL,
+            headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+            json={"inputs": headline, "parameters": {"candidate_labels": HF_LABELS}},
+            timeout=20,
+        )
+        data = resp.json()
+        if isinstance(data, list):
+            data = data[0]
+        if "labels" in data and "scores" in data:
+            top_idx   = data["scores"].index(max(data["scores"]))
+            top_label = data["labels"][top_idx]
+            scores    = {l: s * 100 for l, s in zip(data["labels"], data["scores"])}
+            return top_label, scores
+    except Exception:
+        pass
+    return None, {}
+
+
+def fetch_headlines():
+    """Pull headlines from NewsAPI across multiple queries."""
+    if not NEWS_API_KEY:
+        return []
+    seen, results = set(), []
+    for q in NEWS_QUERIES:
+        try:
+            resp = requests.get(
+                "https://newsapi.org/v2/everything",
+                params={
+                    "q": q, "language": "en", "pageSize": 20,
+                    "sortBy": "publishedAt", "apiKey": NEWS_API_KEY,
+                },
+                timeout=10,
+            )
+            for art in resp.json().get("articles", []):
+                title = (art.get("title") or "").strip()
+                if title and title not in seen:
+                    seen.add(title)
+                    results.append(title)
+        except Exception:
+            pass
+    return results
+
+
+def run_live_pipeline():
+    """Fetch headlines, classify, extract — return DataFrame."""
+    headlines = fetch_headlines()
+    if not headlines:
+        return pd.DataFrame()
+
+    rows = []
+    progress = st.progress(0, text="Fetching & classifying headlines…")
+
+    for i, headline in enumerate(headlines):
+        progress.progress((i + 1) / len(headlines),
+                          text=f"Processing {i+1}/{len(headlines)}…")
+
+        label, scores = classify_headline(headline)
+        if label != "Acquisition":
+            continue
+        acq_score = scores.get("Acquisition", 0)
+        if acq_score < 70:
+            continue
+
+        buyer, target, deal_value = extract_entities(headline)
+        rows.append({
+            "Buyer":      buyer,
+            "Target":     target,
+            "Deal_Value": deal_value,
+            "Category":   "Acquisition",
+            "Acq_%":      round(acq_score, 1),
+            "Partner_%":  round(scores.get("Partnership", 0), 1),
+            "Invest_%":   round(scores.get("Investment", 0), 1),
+            "Other_%":    round(scores.get("Other", 0), 1),
+            "Headline":   headline,
+        })
+        time.sleep(0.3)   # avoid HF rate-limit
+
+    progress.empty()
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+# ─────────────────────────────────────────────
+# DATA LOADER  (CSV fallback)
 # ─────────────────────────────────────────────
 
 @st.cache_data
-def load_data():
-    """Read ma_deals.csv, clean entities, add numeric value column."""
+def load_csv():
     if not CSV_PATH.exists():
-        # Return an empty DataFrame with the expected columns
-        # so the rest of the dashboard renders without crashing
         return pd.DataFrame(columns=[
             "Buyer", "Target", "Deal_Value", "Category",
             "Acq_%", "Partner_%", "Invest_%", "Other_%"
         ])
-
     df = pd.read_csv(CSV_PATH)
-
     for col in ("Buyer", "Target", "Deal_Value"):
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
-
     df["Buyer"]  = df["Buyer"].apply(clean_entity)
     df["Target"] = df["Target"].apply(clean_entity)
-
     df["Deal_Value_Num"] = df["Deal_Value"].apply(
-        lambda v: parse_deal_value(v) if v != "Unknown" else None
-    )
-
+        lambda v: parse_deal_value(v) if v != "Unknown" else None)
     if "Acq_%" not in df.columns:
         df["Acq_%"] = 0.0
-
     return df
 
 # ─────────────────────────────────────────────
@@ -237,8 +388,7 @@ DARK = dict(
 
 def chart_by_buyer(df):
     known = df[df["Buyer"] != "Unknown"]
-    if known.empty:
-        return None
+    if known.empty: return None
     counts = (known.groupby("Buyer").size()
                    .reset_index(name="Deals")
                    .sort_values("Deals", ascending=True))
@@ -280,8 +430,7 @@ def chart_donut(df):
 
 def chart_treemap(df):
     known = df[df["Buyer"] != "Unknown"]
-    if known.empty:
-        return None
+    if known.empty: return None
     counts = known.groupby("Buyer").size().reset_index(name="Deals")
     fig = px.treemap(counts, path=["Buyer"], values="Deals",
                      title="Top Buyers Treemap",
@@ -312,32 +461,54 @@ with hL:
     )
 with hR:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("Reload Data", use_container_width=True, type="primary"):
-        st.cache_data.clear()
-        st.rerun()
+    btn_cols = st.columns(2)
+    fetch_clicked  = btn_cols[0].button("Fetch Live Data", use_container_width=True, type="primary")
+    reload_clicked = btn_cols[1].button("Reload CSV",      use_container_width=True)
 
 st.divider()
 
-# ── How to update data (cloud-friendly info box) ─
+# ── Session state ─────────────────────────────
 
-st.markdown(
-    '<div class="info-box">'
-    '<b>To update with fresh headlines:</b> run <code>python ma_tracker.py</code> locally, '
-    'then push the updated <code>ma_deals.csv</code> to GitHub. '
-    'Streamlit Cloud will automatically reload within seconds.'
-    '</div>',
-    unsafe_allow_html=True,
-)
+if "live_df" not in st.session_state:
+    st.session_state.live_df = None
 
-# ── Load data ────────────────────────────────────
+# ── Fetch live data ───────────────────────────
 
-df = load_data()
+if fetch_clicked:
+    keys_ok = bool(NEWS_API_KEY and HF_API_TOKEN)
+    if not keys_ok:
+        st.error(
+            "API keys not found. Add NEWS_API_KEY and HF_API_TOKEN "
+            "in Streamlit Cloud → App Settings → Secrets."
+        )
+    else:
+        with st.spinner("Fetching live headlines and running AI classification… (~60s)"):
+            live = run_live_pipeline()
+        if live.empty:
+            st.warning("No acquisition deals found in today's headlines. Try again later.")
+        else:
+            st.session_state.live_df = live
+            st.success(f"Found {len(live)} acquisition deals from live news!")
+
+if reload_clicked:
+    st.cache_data.clear()
+    st.session_state.live_df = None
+    st.rerun()
+
+# ── Choose data source ────────────────────────
+
+if st.session_state.live_df is not None:
+    df = st.session_state.live_df.copy()
+    st.markdown(
+        '<p style="color:#3fb950;font-size:0.8rem;margin-bottom:8px;">'
+        'Showing live data fetched this session.</p>',
+        unsafe_allow_html=True,
+    )
+else:
+    df = load_csv()
 
 if df.empty:
-    st.warning(
-        "No deal data found. Run `python ma_tracker.py` locally to generate "
-        "`ma_deals.csv`, commit it, and push to GitHub."
-    )
+    st.warning("No deal data available. Click **Fetch Live Data** to pull today's headlines.")
     st.stop()
 
 # ── KPI cards ────────────────────────────────────
@@ -345,7 +516,7 @@ if df.empty:
 total_deals   = len(df)
 largest_deal  = find_largest_deal(df)
 unique_buyers = df["Buyer"][df["Buyer"] != "Unknown"].nunique()
-avg_conf      = df["Acq_%"].mean() if not df.empty else 0
+avg_conf      = df["Acq_%"].mean() if "Acq_%" in df.columns else 0
 
 kpi_html = """
 <div class="kpi-card">
@@ -375,7 +546,7 @@ with k4:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Charts ────────────────────────────────────────
+# ── Charts ─────────────────────────────────────
 
 cL, cR = st.columns([3, 2])
 with cL:
@@ -393,7 +564,7 @@ if fig_tree:
 
 st.divider()
 
-# ── Filters ───────────────────────────────────────
+# ── Filters ────────────────────────────────────
 
 st.markdown("### Filters & Search")
 st.markdown("<br>", unsafe_allow_html=True)
@@ -410,7 +581,6 @@ with fc2:
 with fc3:
     search = st.text_input("Search", placeholder="Search buyer, target, deal value...")
 
-# Apply filters
 filtered = df.copy()
 if sel_buyer  != "All": filtered = filtered[filtered["Buyer"]  == sel_buyer]
 if sel_target != "All": filtered = filtered[filtered["Target"] == sel_target]
@@ -422,7 +592,7 @@ if search:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Deal cards ────────────────────────────────────
+# ── Deal cards ─────────────────────────────────
 
 count_label = f'{len(filtered)} result{"s" if len(filtered) != 1 else ""}'
 st.markdown(
@@ -441,8 +611,7 @@ else:
     for i in range(0, len(rows), 2):
         col_a, col_b = st.columns(2)
         for col, idx in zip([col_a, col_b], [i, i + 1]):
-            if idx >= len(rows):
-                break
+            if idx >= len(rows): break
             _, row = rows[idx]
             buyer  = row.get("Buyer",      "Unknown")
             target = row.get("Target",     "Unknown")
@@ -459,12 +628,24 @@ else:
                           if value  != "Unknown" else \
                           '<span class="deal-value deal-unknown">Undisclosed</span>'
 
+            # show headline if available (live data)
+            headline_html = ""
+            if "Headline" in row and pd.notna(row["Headline"]):
+                hl = str(row["Headline"])[:100] + ("…" if len(str(row["Headline"])) > 100 else "")
+                headline_html = (
+                    f'<div style="color:#484f58;font-size:0.7rem;'
+                    f'margin-top:4px;font-style:italic;">{hl}</div>'
+                )
+
             with col:
                 st.markdown(f"""
                 <div class="deal-card">
-                  <div style="display:flex;align-items:center;gap:10px;">
-                    {avatar_html(buyer)}
-                    <div>{buyer_html}{target_html}</div>
+                  <div style="flex:1;min-width:0;">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      {avatar_html(buyer)}
+                      <div>{buyer_html}{target_html}</div>
+                    </div>
+                    {headline_html}
                   </div>
                   <div class="deal-right">
                     {value_html}
@@ -476,19 +657,19 @@ else:
 st.markdown("<br>", unsafe_allow_html=True)
 st.divider()
 
-# ── Raw data expander ─────────────────────────────
+# ── Raw data expander ──────────────────────────
 
 with st.expander("View raw data table"):
     show_cols = [c for c in
                  ["Buyer", "Target", "Deal_Value", "Acq_%",
-                  "Partner_%", "Invest_%", "Other_%"]
+                  "Partner_%", "Invest_%", "Other_%", "Headline"]
                  if c in filtered.columns]
     st.dataframe(filtered[show_cols], use_container_width=True, hide_index=True)
 
-# ── Footer ────────────────────────────────────────
+# ── Footer ─────────────────────────────────────
 
 st.markdown(
     '<p style="text-align:center;color:#484f58;font-size:0.72rem;padding:8px 0 2px;">'
-    'Corporate M&A Tracker &nbsp;&bull;&nbsp; NewsAPI &bull; spaCy &bull; '
-    'Hugging Face &nbsp;&bull;&nbsp; Acquisition >= 70% confidence only</p>',
+    'Corporate M&A Tracker &nbsp;&bull;&nbsp; NewsAPI &bull; Hugging Face AI '
+    '&nbsp;&bull;&nbsp; Acquisition >= 70% confidence only</p>',
     unsafe_allow_html=True)
